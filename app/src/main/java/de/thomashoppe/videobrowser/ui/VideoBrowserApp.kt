@@ -251,7 +251,9 @@ private fun SearchScreen(
                 value = excludedTerms,
                 onValueChange = { excludedTerms = it },
                 singleLine = true,
-                label = { Text("Ausschließen, mit Komma trennen") },
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                keyboardActions = KeyboardActions(onSearch = { submitSearch() }),
+                label = { Text("Ausschließen: wort oder \"mehrere wörter\"") },
             )
             filterError?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
         }

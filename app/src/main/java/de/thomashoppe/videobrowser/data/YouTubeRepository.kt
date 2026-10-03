@@ -16,8 +16,18 @@ class MissingApiKeyException : IllegalStateException(
     "YouTube API-Schlüssel fehlt. Lege YOUTUBE_API_KEY in secrets.properties an."
 )
 
+/** Splits `word "multi word"` into independent exclusion terms. */
+internal fun parseExcludedTerms(value: String): List<String> =
+    Regex("\\\"([^\\\"]+)\\\"|(\\S+)")
+        .findAll(value)
+        .map { match -> match.groups[1]?.value ?: match.groups[2]!!.value }
+        .map { it.trim().removePrefix("-") }
+        .filter { it.isNotBlank() }
+        .toList()
+
 class YouTubeRepository(private val dao: VideoDao, appContext: Context) {
     private val api = Network.api(appContext)
+    private val thumbnailShortClassifier = ThumbnailShortClassifier()
 
     val favorites: Flow<List<VideoEntry>> = dao.observeFavorites().map { list -> list.map { it.asVideoEntry() } }
     val history: Flow<List<String>> = dao.observeHistory().map { list -> list.map { it.query } }
@@ -27,21 +37,20 @@ class YouTubeRepository(private val dao: VideoDao, appContext: Context) {
         if (normalized.isBlank()) return@withContext emptyList()
         requireApiKey()
         dao.saveHistory(SearchHistoryEntity(normalized))
-        val excludedTerms = filters.excludedTerms
-            .split(Regex("[,\\n]+"))
-            .map { it.trim().removePrefix("-") }
-            .filter { it.isNotBlank() }
+        val excludedTerms = parseExcludedTerms(filters.excludedTerms)
         // The API receives the documented negative terms, but its relevance engine does not
         // guarantee that these are applied consistently. Apply the same rule to displayed cards.
-        val exclusions = excludedTerms.flatMap { term -> term.split(Regex("\\s+")) }
-            .joinToString(" ") { term -> "-$term" }
+        val exclusions = excludedTerms.joinToString(" ") { term ->
+            if (term.contains(' ')) "-\"$term\"" else "-$term"
+        }
         val apiQuery = listOf(normalized, exclusions).filter { it.isNotBlank() }.joinToString(" ")
-        api.search(
+        val results = api.search(
             query = apiQuery,
             publishedAfter = filters.publishedAfter,
             publishedBefore = filters.publishedBefore,
         )
             .items.mapNotNull { item -> item.id?.videoId?.let { item.snippet.asVideo(it) } }
+        classifyShortThumbnails(results)
             .filterNot { it.likelyShort }
             .filterNot { video ->
                 excludedTerms.any { term ->
@@ -75,7 +84,7 @@ class YouTubeRepository(private val dao: VideoDao, appContext: Context) {
             .flatMap { ids -> api.videos(videoIds = ids.joinToString(",")).items }
             .associateBy { it.id }
 
-        subscriptions.map { subscription ->
+        val overview = subscriptions.map { subscription ->
             val channel = channelsById[subscription.channelId]
             SubscriptionEntry(
                 channelId = subscription.channelId,
@@ -94,6 +103,15 @@ class YouTubeRepository(private val dao: VideoDao, appContext: Context) {
                 subscriberCount = channel?.statistics?.subscriberCount?.toLongOrNull(),
                 videoCount = channel?.statistics?.videoCount?.toLongOrNull(),
                 viewCount = channel?.statistics?.viewCount?.toLongOrNull(),
+            )
+        }
+        val classifiedVideos = classifyShortThumbnails(overview.mapNotNull { it.latestVideo })
+            .associateBy { it.videoId }
+        return@withContext overview.map { subscription ->
+            subscription.copy(
+                latestVideo = subscription.latestVideo?.let { video ->
+                    classifiedVideos[video.videoId]?.takeUnless { it.likelyShort }
+                },
             )
         }
     }
@@ -176,6 +194,21 @@ class YouTubeRepository(private val dao: VideoDao, appContext: Context) {
     suspend fun clearFavorites() = dao.deleteAllFavorites()
     suspend fun removeHistory(query: String) = dao.deleteHistory(query)
     suspend fun clearHistory() = dao.deleteAllHistory()
+
+    /** Processes four images at once to keep refreshes responsive without flooding the thumbnail host. */
+    private suspend fun classifyShortThumbnails(entries: List<VideoEntry>): List<VideoEntry> =
+        entries.chunked(4).flatMap { batch ->
+            coroutineScope {
+                batch.map { entry ->
+                    async {
+                        val looksLikeShort = !entry.likelyShort && entry.thumbnailUrl?.let {
+                            thumbnailShortClassifier.isLikelyShort(it)
+                        } == true
+                        if (looksLikeShort) entry.copy(likelyShort = true) else entry
+                    }
+                }.awaitAll()
+            }
+        }
 
     private fun requireApiKey() {
         if (BuildConfig.YOUTUBE_API_KEY.isBlank()) throw MissingApiKeyException()
